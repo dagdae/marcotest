@@ -1,0 +1,1827 @@
+# ============================================================
+#  SIMULATORE (generato da termostato_esphome.yaml)
+#  Gira sul PC con la piattaforma "host" di ESPHome e una finestra SDL 480x480:
+#  il mouse fa da touch. Stessa logica, programma, interfaccia LVGL e stand-by del vero.
+#  Differenze: sensore e relè sono simulati (la stanza si scalda col relè acceso),
+#  il Wi-Fi è un interruttore ("Wi-Fi simulato"), i tempi minimi del termostato sono 20 s.
+#
+#  Uso (Linux/macOS/WSL):   pip install esphome  +  libsdl2-dev installato
+#                           esphome run termostato_sim.yaml
+# ============================================================
+#  Termostato smart autonomo - Guition ESP32-S3-4848S040 (versione con relè)
+#  ESPHome: termostato on-device + programma settimanale + ora via internet (SNTP)
+#  + interfaccia LVGL con icone MDI e icona Wi-Fi + stand-by e luminosità giorno/notte.
+#
+#  Autonomia: il termostato gira sul chip. Senza HA e senza rete continua a regolare.
+#  Il programma settimanale (48 mezz'ore x 7 giorni) si modifica dal pannello (pagina Programma,
+#  icona calendario) e resta salvato nella flash del dispositivo.
+#  L'ora arriva via SNTP con fuso Europe/Rome (ora solare/legale automatica).
+#  Finché l'ora non è valida (blackout senza rete) resta il preset Eco.
+# ============================================================
+
+substitutions:
+  device_name: termostato-sim
+  friendly_name: "Termostato Casa"
+  temp_comfort: "20.5"
+  temp_eco: "17.0"
+  wifi_ok_expr: "id(sim_wifi).state"
+  glyphs: " %()+,-.:·0123456789°ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzàèéìòù"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: wake_screen
+
+logger:
+
+climate:
+  - platform: thermostat
+    id: termostato
+    name: "Termostato"
+    sensor: temp_stanza
+    min_idle_time: 30s
+    min_heating_off_time: 20s    # protegge la caldaia dai cicli brevi
+    min_heating_run_time: 20s
+    heat_deadband: 0.3 °C         # accende a (setpoint - 0.3)
+    heat_overrun: 0.2 °C          # spegne a (setpoint + 0.2)
+    heat_action:
+      - switch.turn_on: relay_caldaia
+    idle_action:
+      - switch.turn_off: relay_caldaia
+    on_boot_restore_from: default_preset   # avvio deterministico: Eco finché il programma non parte
+    default_preset: Eco
+    preset:
+      - name: Eco
+        mode: heat
+        default_target_temperature_low: ${temp_eco} °C
+      - name: Comfort
+        mode: heat
+        default_target_temperature_low: ${temp_comfort} °C
+    visual:
+      min_temperature: 15 °C
+      max_temperature: 24 °C
+      temperature_step: 0.5 °C
+
+# --- Stato condiviso ---
+globals:
+  - id: sim_temp
+    type: float
+    initial_value: '18.0'
+  - id: last_slot        # -1 non applicato, 0 Eco, 1 Comfort
+    type: int
+    initial_value: '-1'
+  - id: ui_preset        # 0 manuale, 1 Eco, 2 Comfort (solo per evidenziare i chip)
+    type: int
+    initial_value: '1'
+  - id: screen_on
+    type: bool
+    initial_value: 'true'
+  - id: touch_guard      # ignora i tocchi che hanno solo svegliato lo schermo
+    type: bool
+    initial_value: 'false'
+  - id: ui_day            # giorno mostrato nell'editor: 0 = lunedì ... 6 = domenica
+    type: int
+    initial_value: '0'
+  - id: sched_0           # programma del giorno 0 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35150012473344ULL'
+  - id: sched_1           # programma del giorno 1 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35150012473344ULL'
+  - id: sched_2           # programma del giorno 2 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35150012473344ULL'
+  - id: sched_3           # programma del giorno 3 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35150012473344ULL'
+  - id: sched_4           # programma del giorno 4 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35150012473344ULL'
+  - id: sched_5           # programma del giorno 5 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35184372056064ULL'
+  - id: sched_6           # programma del giorno 6 (0 = lunedì): bit i = mezz'ora i, 1 = Comfort
+    type: uint64_t
+    restore_value: true
+    initial_value: '35184372056064ULL'
+
+# --- Retroilluminazione ---
+light:
+  - platform: monochromatic
+    id: display_backlight
+    name: "Retroilluminazione"
+    output: backlight_output
+    restore_mode: ALWAYS_ON
+    default_transition_length: 1s
+
+# Il tramonto è calcolato in locale (serve solo l'ora valida). Coordinate approssimative di Staranzano.
+sun:
+  id: sole
+  latitude: 45.8°
+  longitude: 13.5°
+
+script:
+  # Accende lo schermo con la luminosità giusta e fa ripartire il conto alla rovescia.
+  - id: wake_screen
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(screen_on)) id(touch_guard) = true;
+          id(screen_on) = true;
+      - light.turn_on:
+          id: display_backlight
+          brightness: !lambda |-
+            auto t = id(sntp_time).now();
+            // giorno = sole sopra l'orizzonte E tra le 06:00 e le 21:00; ora non valida -> giorno
+            bool day = !t.is_valid() || (id(sole).elevation() > 0 && t.hour >= 6 && t.hour < 21);   // CAMBIA orari
+            return day ? 1.0f : 0.15f;                                                               // CAMBIA luminosità
+          transition_length: 300ms
+      - script.execute: guard_release
+      - script.execute: screen_timer
+  - id: guard_release
+    mode: restart
+    then:
+      - delay: 600ms
+      - lambda: 'id(touch_guard) = false;'
+  - id: screen_timer
+    mode: restart
+    then:
+      - delay: 30s                                                                                   # CAMBIA timeout stand-by
+      - light.turn_off:
+          id: display_backlight
+          transition_length: 1s
+      - lvgl.page.show: pg_main
+      - lambda: 'id(screen_on) = false;'
+
+  # --- Editor del programma ---
+  - id: refresh_editor
+    then:
+      - lambda: |-
+          uint64_t *S[7] = {&id(sched_0), &id(sched_1), &id(sched_2), &id(sched_3), &id(sched_4), &id(sched_5), &id(sched_6)};
+          lv_obj_t *cells[48] = {id(cell_0), id(cell_1), id(cell_2), id(cell_3), id(cell_4), id(cell_5), id(cell_6), id(cell_7), id(cell_8), id(cell_9), id(cell_10), id(cell_11), id(cell_12), id(cell_13), id(cell_14), id(cell_15), id(cell_16), id(cell_17), id(cell_18), id(cell_19), id(cell_20), id(cell_21), id(cell_22), id(cell_23), id(cell_24), id(cell_25), id(cell_26), id(cell_27), id(cell_28), id(cell_29), id(cell_30), id(cell_31), id(cell_32), id(cell_33), id(cell_34), id(cell_35), id(cell_36), id(cell_37), id(cell_38), id(cell_39), id(cell_40), id(cell_41), id(cell_42), id(cell_43), id(cell_44), id(cell_45), id(cell_46), id(cell_47)};
+          lv_obj_t *tabs[7] = {id(tab_0), id(tab_1), id(tab_2), id(tab_3), id(tab_4), id(tab_5), id(tab_6)};
+          lv_obj_t *tabl[7] = {id(tabl_0), id(tabl_1), id(tabl_2), id(tabl_3), id(tabl_4), id(tabl_5), id(tabl_6)};
+          int d = id(ui_day);
+          uint64_t mask = *S[d] & ((1ULL << 48) - 1);
+          auto t = id(sntp_time).now();
+          int today = t.is_valid() ? (t.day_of_week + 5) % 7 : -1;
+          int now_idx = t.is_valid() ? (t.hour * 60 + t.minute) / 30 : -1;
+          for (int i = 0; i < 48; i++) {
+            bool on = ((mask >> i) & 1ULL) != 0;
+            bool mark = (d == today && i == now_idx);
+            lv_obj_set_style_bg_color(cells[i], lv_color_hex(on ? 0xEF9F27 : 0x2C2C2A), LV_PART_MAIN);
+            lv_obj_set_style_border_color(cells[i], lv_color_hex(mark ? 0xF1EFE8 : (on ? 0xEF9F27 : 0x444441)), LV_PART_MAIN);
+            lv_obj_set_style_border_width(cells[i], mark ? 3 : 1, LV_PART_MAIN);
+          }
+          for (int k = 0; k < 7; k++) {
+            bool sel = (k == d);
+            lv_obj_set_style_bg_color(tabs[k], lv_color_hex(sel ? 0xF1EFE8 : 0x161615), LV_PART_MAIN);
+            lv_obj_set_style_border_color(tabs[k], lv_color_hex(sel ? 0xF1EFE8 : 0x5F5E5A), LV_PART_MAIN);
+            lv_obj_set_style_text_color(tabl[k], lv_color_hex(sel ? 0x161615 : 0xB4B2A9), LV_PART_MAIN);
+          }
+          int cm = __builtin_popcountll(mask) * 30;
+          int em = 1440 - cm;
+          char b[56];
+          snprintf(b, sizeof(b), "Comfort %d h%s · Eco %d h%s", cm / 60, (cm % 60) ? " 30" : "", em / 60, (em % 60) ? " 30" : "");
+          lv_label_set_text(id(lbl_sum), b);
+  - id: toggle_cell
+    parameters:
+      idx: int
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(touch_guard);'
+          then:
+            - lambda: |-
+                uint64_t *S[7] = {&id(sched_0), &id(sched_1), &id(sched_2), &id(sched_3), &id(sched_4), &id(sched_5), &id(sched_6)};
+                *S[id(ui_day)] ^= (1ULL << idx);
+                id(last_slot) = -1;       // riapplica subito il programma
+            - script.execute: refresh_editor
+            - script.execute: show_saved
+  - id: select_day
+    parameters:
+      d: int
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(touch_guard);'
+          then:
+            - lambda: 'id(ui_day) = d;'
+            - script.execute: refresh_editor
+  - id: copy_day
+    parameters:
+      n_days: int
+    then:
+      - if:
+          condition:
+            lambda: 'return !id(touch_guard);'
+          then:
+            - lambda: |-
+                uint64_t *S[7] = {&id(sched_0), &id(sched_1), &id(sched_2), &id(sched_3), &id(sched_4), &id(sched_5), &id(sched_6)};
+                uint64_t m = *S[id(ui_day)];
+                for (int i = 0; i < n_days; i++) *S[i] = m;
+                id(last_slot) = -1;       // riapplica subito il programma
+            - script.execute: refresh_editor
+            - script.execute: show_saved
+  - id: show_saved
+    mode: restart
+    then:
+      - lambda: 'lv_obj_clear_flag(id(lbl_saved), LV_OBJ_FLAG_HIDDEN);'
+      - delay: 1200ms
+      - lambda: 'lv_obj_add_flag(id(lbl_saved), LV_OBJ_FLAG_HIDDEN);'
+
+# --- Programma settimanale + aggiornamento interfaccia (ogni 500 ms) ---
+# Il programma applica Comfort/Eco solo quando la fascia CAMBIA, così un override
+# manuale resta valido fino alla prossima transizione. Gli orari si modificano dal pannello.
+interval:
+  - interval: 500ms
+    then:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          uint64_t *S[7] = {&id(sched_0), &id(sched_1), &id(sched_2), &id(sched_3), &id(sched_4), &id(sched_5), &id(sched_6)};
+          auto comfort_at = [&](int dow, int m) -> bool {     // dow: 1 = domenica ... 7 = sabato; programma: 0 = lunedì ... 6 = domenica
+            return ((*S[(dow + 5) % 7] >> (m / 30)) & 1ULL) != 0;
+          };
+          static const char *giorni[] = {"dom", "lun", "mar", "mer", "gio", "ven", "sab"};
+          static const char *mesi[] = {"gen", "feb", "mar", "apr", "mag", "giu", "lug", "ago", "set", "ott", "nov", "dic"};
+          static int last_min = -1;
+          static char nxt[56] = "Ora non disponibile";
+          char buf[56];
+
+          if (t.is_valid()) {
+            int m = t.hour * 60 + t.minute;
+            int slot = comfort_at(t.day_of_week, m) ? 1 : 0;
+            if (slot != id(last_slot)) {
+              id(last_slot) = slot;
+              id(ui_preset) = slot ? 2 : 1;
+              auto call = id(termostato).make_call();
+              call.set_preset(slot ? climate::CLIMATE_PRESET_COMFORT : climate::CLIMATE_PRESET_ECO);
+              call.perform();
+            }
+            snprintf(buf, sizeof(buf), "%02d:%02d · %s %d %s", t.hour, t.minute,
+                     giorni[t.day_of_week - 1], t.day_of_month, mesi[t.month - 1]);
+            if (m != last_min) {
+              last_min = m;
+              snprintf(nxt, sizeof(nxt), "Programma invariato");
+              for (int k = 1; k <= 7 * 1440; k++) {
+                int tot = m + k;
+                int dd = tot / 1440;
+                int mm = tot % 1440;
+                int dw = (t.day_of_week - 1 + dd) % 7 + 1;
+                if (comfort_at(dw, mm) != (slot == 1)) {
+                  if (dd == 0)
+                    snprintf(nxt, sizeof(nxt), "Prossima fascia %02d:%02d · %s", mm / 60, mm % 60, slot ? "Eco" : "Comfort");
+                  else
+                    snprintf(nxt, sizeof(nxt), "Prossima fascia %s %02d:%02d · %s", giorni[dw - 1], mm / 60, mm % 60, slot ? "Eco" : "Comfort");
+                  break;
+                }
+              }
+            }
+          } else {
+            snprintf(buf, sizeof(buf), "--:--");
+            snprintf(nxt, sizeof(nxt), "Ora non disponibile");
+            last_min = -1;
+          }
+
+          float cur = id(temp_stanza).state;
+          float hum = id(hum_stanza).state;
+          float sp = id(termostato).target_temperature;
+          if (std::isnan(sp)) sp = 20.0f;
+          bool heat = id(relay_caldaia).state;
+          bool wifi_ok = ${wifi_ok_expr};
+          char tmp[24];
+
+          lv_label_set_text(id(lbl_time), buf);
+          lv_label_set_text(id(lbl_next), nxt);
+
+          if (std::isnan(cur)) snprintf(tmp, sizeof(tmp), "--.-°"); else snprintf(tmp, sizeof(tmp), "%.1f°", cur);
+          lv_label_set_text(id(lbl_cur), tmp);
+          if (std::isnan(hum)) snprintf(tmp, sizeof(tmp), "--%% · interno"); else snprintf(tmp, sizeof(tmp), "%.0f%% · interno", hum);
+          lv_label_set_text(id(lbl_hum), tmp);
+          snprintf(tmp, sizeof(tmp), "Imposta %.1f°", sp);
+          lv_label_set_text(id(lbl_sp), tmp);
+
+          lv_arc_set_value(id(arc_sp), (int) roundf(sp * 10.0f));
+          uint32_t col = heat ? 0xEF9F27 : 0x5DCAA5;
+          lv_obj_set_style_arc_color(id(arc_sp), lv_color_hex(col), LV_PART_INDICATOR);
+          lv_obj_set_style_text_color(id(lbl_sp), lv_color_hex(col), LV_PART_MAIN);
+
+          lv_obj_set_style_bg_color(id(pill), lv_color_hex(heat ? 0x412402 : 0x2C2C2A), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(pill_ic), lv_color_hex(heat ? 0xFAC775 : 0x888780), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(pill_tx), lv_color_hex(heat ? 0xFAC775 : 0xB4B2A9), LV_PART_MAIN);
+          lv_label_set_text(id(pill_tx), heat ? "Caldaia accesa" : "In attesa");
+
+          // icona Wi-Fi: normale se connesso, barrata e ambra se la rete manca
+          lv_label_set_text(id(lbl_wifi), wifi_ok ? "\U000F05A9" : "\U000F05AA");
+          lv_obj_set_style_text_color(id(lbl_wifi), lv_color_hex(wifi_ok ? 0xB4B2A9 : 0xEF9F27), LV_PART_MAIN);
+
+          bool eco = (id(ui_preset) == 1), cmf = (id(ui_preset) == 2);
+          lv_obj_set_style_bg_color(id(chip_eco), lv_color_hex(eco ? 0xF1EFE8 : 0x161615), LV_PART_MAIN);
+          lv_obj_set_style_border_color(id(chip_eco), lv_color_hex(eco ? 0xF1EFE8 : 0x5F5E5A), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(chip_eco_ic), lv_color_hex(eco ? 0x161615 : 0xB4B2A9), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(chip_eco_tx), lv_color_hex(eco ? 0x161615 : 0xB4B2A9), LV_PART_MAIN);
+          lv_obj_set_style_bg_color(id(chip_cmf), lv_color_hex(cmf ? 0xF1EFE8 : 0x161615), LV_PART_MAIN);
+          lv_obj_set_style_border_color(id(chip_cmf), lv_color_hex(cmf ? 0xF1EFE8 : 0x5F5E5A), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(chip_cmf_ic), lv_color_hex(cmf ? 0x161615 : 0xB4B2A9), LV_PART_MAIN);
+          lv_obj_set_style_text_color(id(chip_cmf_tx), lv_color_hex(cmf ? 0x161615 : 0xB4B2A9), LV_PART_MAIN);
+
+  # Simulazione fisica: con il relè acceso la stanza si scalda, spento si raffredda
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (id(relay_caldaia).state) id(sim_temp) += 0.15f;
+          else id(sim_temp) -= 0.05f;
+          if (id(sim_temp) < 12.0f) id(sim_temp) = 12.0f;
+          if (id(sim_temp) > 30.0f) id(sim_temp) = 30.0f;
+
+# --- Pulsante per riprendere il programma dopo un override manuale ---
+button:
+  - platform: template
+    name: "Riprendi programma"
+    on_press:
+      - lambda: 'id(last_slot) = -1;'
+
+# ============================================================
+#  Display, touch, font e interfaccia LVGL
+# ============================================================
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 500
+    id: r_big
+    size: 80
+    glyphs: "0123456789.°-"
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: r_24
+    size: 24
+    glyphs: ${glyphs}
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: r_18
+    size: 18
+    glyphs: ${glyphs}
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: r_16
+    size: 16
+    glyphs: ${glyphs}
+  # Material Design Icons (scaricato in fase di compilazione). Codepoint: verifica su pictogrammers.com/library/mdi
+  - file:
+      type: web
+      url: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: mdi_22
+    size: 22
+    bpp: 4
+    glyphs:
+      - "\U000F0238"   # fire
+      - "\U000F032A"   # leaf
+      - "\U000F05A8"   # white-balance-sunny
+      - "\U000F058E"   # water-percent
+  - file:
+      type: web
+      url: https://github.com/Templarian/MaterialDesign-Webfont/raw/master/fonts/materialdesignicons-webfont.ttf
+    id: mdi_32
+    size: 32
+    bpp: 4
+    glyphs:
+      - "\U000F05A9"   # wifi
+      - "\U000F05AA"   # wifi-off
+      - "\U000F0374"   # minus
+      - "\U000F0415"   # plus
+      - "\U000F00F0"   # calendar-clock
+      - "\U000F0141"   # chevron-left
+
+lvgl:
+  bg_color: 0x161615
+  buffer_size: 25%
+  pages:
+    - id: pg_main
+      bg_color: 0x161615
+      widgets:
+        - label:
+            id: lbl_time
+            align: TOP_LEFT
+            x: 24
+            y: 18
+            text: "--:--"
+            text_font: r_18
+            text_color: 0xB4B2A9
+        - label:
+            id: lbl_wifi
+            align: TOP_RIGHT
+            x: -24
+            y: 12
+            text: "\U000F05AA"
+            text_font: mdi_32
+            text_color: 0xEF9F27
+        - button:
+            id: btn_prog
+            align: TOP_RIGHT
+            x: -70
+            y: 4
+            width: 48
+            height: 48
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F00F0"
+                  text_font: mdi_32
+                  text_color: 0xB4B2A9
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(touch_guard);'
+                  then:
+                    - lambda: |-
+                        auto t = id(sntp_time).now();
+                        if (t.is_valid()) id(ui_day) = (t.day_of_week + 5) % 7;
+                    - script.execute: refresh_editor
+                    - lvgl.page.show: pg_prog
+        - arc:
+            id: arc_sp
+            align: CENTER
+            x: 0
+            y: -7
+            width: 360
+            height: 360
+            min_value: 150
+            max_value: 240
+            value: 205
+            start_angle: 135
+            end_angle: 45
+            adjustable: false
+            clickable: false
+            bg_opa: TRANSP
+            border_width: 0
+            arc_width: 16
+            arc_color: 0x2C2C2A
+            indicator:
+              arc_width: 16
+              arc_color: 0xEF9F27
+            knob:
+              bg_color: 0x161615
+              border_color: 0xF1EFE8
+              border_width: 3
+        - label:
+            id: lbl_cur
+            align: CENTER
+            x: 0
+            y: -62
+            text: "--.-°"
+            text_font: r_big
+            text_color: 0xF1EFE8
+        - label:
+            id: lbl_hum_ic
+            align: CENTER
+            x: -78
+            y: -6
+            text: "\U000F058E"
+            text_font: mdi_22
+            text_color: 0xB4B2A9
+        - label:
+            id: lbl_hum
+            align: CENTER
+            x: 14
+            y: -6
+            text: "--% · interno"
+            text_font: r_18
+            text_color: 0xB4B2A9
+        - label:
+            id: lbl_sp
+            align: CENTER
+            x: 0
+            y: 35
+            text: "Imposta 20.5°"
+            text_font: r_24
+            text_color: 0xEF9F27
+        - obj:
+            id: pill
+            align: CENTER
+            x: 0
+            y: 86
+            width: 146
+            height: 35
+            radius: 18
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x2C2C2A
+            scrollable: false
+            widgets:
+              - label:
+                  id: pill_ic
+                  align: LEFT_MID
+                  x: 10
+                  text: "\U000F0238"
+                  text_font: mdi_22
+                  text_color: 0x888780
+              - label:
+                  id: pill_tx
+                  align: LEFT_MID
+                  x: 38
+                  text: "In attesa"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+        - button:
+            id: btn_minus
+            align: TOP_LEFT
+            x: 96
+            y: 317
+            width: 70
+            height: 70
+            radius: 35
+            bg_color: 0x2C2C2A
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F0374"
+                  text_font: mdi_32
+                  text_color: 0xF1EFE8
+            on_click:
+              - lambda: |-
+                  if (id(touch_guard)) return;
+                  float t = id(termostato).target_temperature;
+                  if (std::isnan(t)) t = 20.0f;
+                  t = std::max(15.0f, t - 0.5f);
+                  id(ui_preset) = 0;
+                  auto call = id(termostato).make_call();
+                  call.set_target_temperature(t);
+                  call.perform();
+        - button:
+            id: btn_plus
+            align: TOP_LEFT
+            x: 314
+            y: 317
+            width: 70
+            height: 70
+            radius: 35
+            bg_color: 0x2C2C2A
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F0415"
+                  text_font: mdi_32
+                  text_color: 0xF1EFE8
+            on_click:
+              - lambda: |-
+                  if (id(touch_guard)) return;
+                  float t = id(termostato).target_temperature;
+                  if (std::isnan(t)) t = 20.0f;
+                  t = std::min(24.0f, t + 0.5f);
+                  id(ui_preset) = 0;
+                  auto call = id(termostato).make_call();
+                  call.set_target_temperature(t);
+                  call.perform();
+        - button:
+            id: chip_eco
+            align: TOP_LEFT
+            x: 83
+            y: 389
+            width: 139
+            height: 45
+            radius: 23
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: chip_eco_ic
+                  align: LEFT_MID
+                  x: 14
+                  text: "\U000F032A"
+                  text_font: mdi_22
+                  text_color: 0xB4B2A9
+              - label:
+                  id: chip_eco_tx
+                  align: LEFT_MID
+                  x: 48
+                  text: "Eco"
+                  text_font: r_18
+                  text_color: 0xB4B2A9
+            on_click:
+              - lambda: |-
+                  if (id(touch_guard)) return;
+                  id(ui_preset) = 1;
+                  auto call = id(termostato).make_call();
+                  call.set_preset(climate::CLIMATE_PRESET_ECO);
+                  call.perform();
+        - button:
+            id: chip_cmf
+            align: TOP_LEFT
+            x: 259
+            y: 389
+            width: 139
+            height: 45
+            radius: 23
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: chip_cmf_ic
+                  align: LEFT_MID
+                  x: 14
+                  text: "\U000F05A8"
+                  text_font: mdi_22
+                  text_color: 0xB4B2A9
+              - label:
+                  id: chip_cmf_tx
+                  align: LEFT_MID
+                  x: 48
+                  text: "Comfort"
+                  text_font: r_18
+                  text_color: 0xB4B2A9
+            on_click:
+              - lambda: |-
+                  if (id(touch_guard)) return;
+                  id(ui_preset) = 2;
+                  auto call = id(termostato).make_call();
+                  call.set_preset(climate::CLIMATE_PRESET_COMFORT);
+                  call.perform();
+        - label:
+            id: lbl_next
+            align: BOTTOM_MID
+            y: -14
+            text: "Ora non disponibile"
+            text_font: r_16
+            text_color: 0x888780
+    - id: pg_prog
+      bg_color: 0x161615
+      widgets:
+        - button:
+            id: btn_back
+            align: TOP_LEFT
+            x: 10
+            y: 6
+            width: 56
+            height: 48
+            bg_opa: TRANSP
+            border_width: 0
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\U000F0141"
+                  text_font: mdi_32
+                  text_color: 0xB4B2A9
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !id(touch_guard);'
+                  then:
+                    - lvgl.page.show: pg_main
+        - label:
+            align: TOP_MID
+            y: 14
+            text: "Programma"
+            text_font: r_24
+            text_color: 0xF1EFE8
+        - button:
+            id: tab_0
+            align: TOP_LEFT
+            x: 28
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_0
+                  align: CENTER
+                  text: "Lun"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 0
+        - button:
+            id: tab_1
+            align: TOP_LEFT
+            x: 89
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_1
+                  align: CENTER
+                  text: "Mar"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 1
+        - button:
+            id: tab_2
+            align: TOP_LEFT
+            x: 150
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_2
+                  align: CENTER
+                  text: "Mer"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 2
+        - button:
+            id: tab_3
+            align: TOP_LEFT
+            x: 211
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_3
+                  align: CENTER
+                  text: "Gio"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 3
+        - button:
+            id: tab_4
+            align: TOP_LEFT
+            x: 272
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_4
+                  align: CENTER
+                  text: "Ven"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 4
+        - button:
+            id: tab_5
+            align: TOP_LEFT
+            x: 333
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_5
+                  align: CENTER
+                  text: "Sab"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 5
+        - button:
+            id: tab_6
+            align: TOP_LEFT
+            x: 394
+            y: 58
+            width: 56
+            height: 40
+            radius: 20
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  id: tabl_6
+                  align: CENTER
+                  text: "Dom"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: select_day
+                  d: 6
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 119
+            text: "00:00"
+            text_font: r_16
+            text_color: 0x888780
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 164
+            text: "04:00"
+            text_font: r_16
+            text_color: 0x888780
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 209
+            text: "08:00"
+            text_font: r_16
+            text_color: 0x888780
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 254
+            text: "12:00"
+            text_font: r_16
+            text_color: 0x888780
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 299
+            text: "16:00"
+            text_font: r_16
+            text_color: 0x888780
+        - label:
+            align: TOP_LEFT
+            x: 14
+            y: 344
+            text: "20:00"
+            text_font: r_16
+            text_color: 0x888780
+        - button:
+            id: cell_0
+            align: TOP_LEFT
+            x: 72
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 0
+        - button:
+            id: cell_1
+            align: TOP_LEFT
+            x: 119
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 1
+        - button:
+            id: cell_2
+            align: TOP_LEFT
+            x: 166
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 2
+        - button:
+            id: cell_3
+            align: TOP_LEFT
+            x: 213
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 3
+        - button:
+            id: cell_4
+            align: TOP_LEFT
+            x: 260
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 4
+        - button:
+            id: cell_5
+            align: TOP_LEFT
+            x: 307
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 5
+        - button:
+            id: cell_6
+            align: TOP_LEFT
+            x: 354
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 6
+        - button:
+            id: cell_7
+            align: TOP_LEFT
+            x: 401
+            y: 108
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 7
+        - button:
+            id: cell_8
+            align: TOP_LEFT
+            x: 72
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 8
+        - button:
+            id: cell_9
+            align: TOP_LEFT
+            x: 119
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 9
+        - button:
+            id: cell_10
+            align: TOP_LEFT
+            x: 166
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 10
+        - button:
+            id: cell_11
+            align: TOP_LEFT
+            x: 213
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 11
+        - button:
+            id: cell_12
+            align: TOP_LEFT
+            x: 260
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 12
+        - button:
+            id: cell_13
+            align: TOP_LEFT
+            x: 307
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 13
+        - button:
+            id: cell_14
+            align: TOP_LEFT
+            x: 354
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 14
+        - button:
+            id: cell_15
+            align: TOP_LEFT
+            x: 401
+            y: 153
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 15
+        - button:
+            id: cell_16
+            align: TOP_LEFT
+            x: 72
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 16
+        - button:
+            id: cell_17
+            align: TOP_LEFT
+            x: 119
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 17
+        - button:
+            id: cell_18
+            align: TOP_LEFT
+            x: 166
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 18
+        - button:
+            id: cell_19
+            align: TOP_LEFT
+            x: 213
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 19
+        - button:
+            id: cell_20
+            align: TOP_LEFT
+            x: 260
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 20
+        - button:
+            id: cell_21
+            align: TOP_LEFT
+            x: 307
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 21
+        - button:
+            id: cell_22
+            align: TOP_LEFT
+            x: 354
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 22
+        - button:
+            id: cell_23
+            align: TOP_LEFT
+            x: 401
+            y: 198
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 23
+        - button:
+            id: cell_24
+            align: TOP_LEFT
+            x: 72
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 24
+        - button:
+            id: cell_25
+            align: TOP_LEFT
+            x: 119
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 25
+        - button:
+            id: cell_26
+            align: TOP_LEFT
+            x: 166
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 26
+        - button:
+            id: cell_27
+            align: TOP_LEFT
+            x: 213
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 27
+        - button:
+            id: cell_28
+            align: TOP_LEFT
+            x: 260
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 28
+        - button:
+            id: cell_29
+            align: TOP_LEFT
+            x: 307
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 29
+        - button:
+            id: cell_30
+            align: TOP_LEFT
+            x: 354
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 30
+        - button:
+            id: cell_31
+            align: TOP_LEFT
+            x: 401
+            y: 243
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 31
+        - button:
+            id: cell_32
+            align: TOP_LEFT
+            x: 72
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 32
+        - button:
+            id: cell_33
+            align: TOP_LEFT
+            x: 119
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 33
+        - button:
+            id: cell_34
+            align: TOP_LEFT
+            x: 166
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 34
+        - button:
+            id: cell_35
+            align: TOP_LEFT
+            x: 213
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 35
+        - button:
+            id: cell_36
+            align: TOP_LEFT
+            x: 260
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 36
+        - button:
+            id: cell_37
+            align: TOP_LEFT
+            x: 307
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 37
+        - button:
+            id: cell_38
+            align: TOP_LEFT
+            x: 354
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 38
+        - button:
+            id: cell_39
+            align: TOP_LEFT
+            x: 401
+            y: 288
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 39
+        - button:
+            id: cell_40
+            align: TOP_LEFT
+            x: 72
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 40
+        - button:
+            id: cell_41
+            align: TOP_LEFT
+            x: 119
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 41
+        - button:
+            id: cell_42
+            align: TOP_LEFT
+            x: 166
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 42
+        - button:
+            id: cell_43
+            align: TOP_LEFT
+            x: 213
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 43
+        - button:
+            id: cell_44
+            align: TOP_LEFT
+            x: 260
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 44
+        - button:
+            id: cell_45
+            align: TOP_LEFT
+            x: 307
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 45
+        - button:
+            id: cell_46
+            align: TOP_LEFT
+            x: 354
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 46
+        - button:
+            id: cell_47
+            align: TOP_LEFT
+            x: 401
+            y: 333
+            width: 44
+            height: 40
+            radius: 9
+            bg_color: 0x2C2C2A
+            border_color: 0x444441
+            border_width: 1
+            shadow_width: 0
+            on_click:
+              - script.execute:
+                  id: toggle_cell
+                  idx: 47
+        - obj:
+            align: TOP_LEFT
+            x: 24
+            y: 388
+            width: 12
+            height: 12
+            radius: 3
+            bg_color: 0xEF9F27
+            border_width: 0
+        - label:
+            align: TOP_LEFT
+            x: 42
+            y: 383
+            text: "Comfort"
+            text_font: r_16
+            text_color: 0xB4B2A9
+        - obj:
+            align: TOP_LEFT
+            x: 116
+            y: 388
+            width: 12
+            height: 12
+            radius: 3
+            bg_color: 0x2C2C2A
+            border_color: 0x5F5E5A
+            border_width: 1
+        - label:
+            align: TOP_LEFT
+            x: 134
+            y: 383
+            text: "Eco"
+            text_font: r_16
+            text_color: 0xB4B2A9
+        - label:
+            id: lbl_sum
+            align: TOP_RIGHT
+            x: -24
+            y: 383
+            text: "Comfort 0 h · Eco 24 h"
+            text_font: r_16
+            text_color: 0xB4B2A9
+        - button:
+            id: btn_copy_wd
+            align: TOP_LEFT
+            x: 24
+            y: 418
+            width: 180
+            height: 38
+            radius: 19
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Copia su lun-ven"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: copy_day
+                  n_days: 5
+        - button:
+            id: btn_copy_all
+            align: TOP_LEFT
+            x: 214
+            y: 418
+            width: 140
+            height: 38
+            radius: 19
+            bg_color: 0x161615
+            border_color: 0x5F5E5A
+            border_width: 1
+            shadow_width: 0
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Copia su tutti"
+                  text_font: r_16
+                  text_color: 0xB4B2A9
+            on_click:
+              - script.execute:
+                  id: copy_day
+                  n_days: 7
+        - label:
+            id: lbl_saved
+            align: TOP_RIGHT
+            x: -24
+            y: 428
+            hidden: true
+            text: "Salvato"
+            text_font: r_16
+            text_color: 0x5DCAA5
+
+# --- Parti simulate (al posto di hardware, Wi-Fi e OTA) ---
+host:
+
+time:
+  - platform: host
+    id: sntp_time
+
+display:
+  - platform: sdl
+    id: tft_display
+    dimensions:
+      width: 480
+      height: 480
+
+touchscreen:
+  - platform: sdl
+    id: tft_touch
+    on_touch:
+      - script.execute: wake_screen
+
+sensor:
+  - platform: template
+    id: temp_stanza
+    name: "Temperatura stanza (simulata)"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    update_interval: 2s
+    lambda: 'return id(sim_temp);'
+  - platform: template
+    id: hum_stanza
+    name: "Umidità stanza (simulata)"
+    unit_of_measurement: "%"
+    device_class: humidity
+    update_interval: 10s
+    lambda: 'return 52.0;'
+
+switch:
+  - platform: template
+    id: relay_caldaia
+    name: "Relè caldaia (simulato)"
+    optimistic: true
+  - platform: template
+    id: sim_wifi
+    name: "Wi-Fi simulato"
+    optimistic: true
+    restore_mode: ALWAYS_ON
+
+output:
+  - platform: template
+    id: backlight_output
+    type: float
+    write_action:
+      - logger.log:
+          format: "Backlight simulato: %.2f"
+          args: ["state"]
+          level: DEBUG
